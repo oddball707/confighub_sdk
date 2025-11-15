@@ -107,12 +107,48 @@ func runSingleUnitSetTarget(unitSlug, targetSlug string) error {
 		"application/merge-patch+json",
 		bytes.NewReader(patchJSON),
 	)
+
+	var retried bool
 	if cubapi.IsAPIError(err, unitRes) {
-		return cubapi.InterpretErrorGeneric(err, unitRes)
+		apiErr := cubapi.InterpretErrorGeneric(err, unitRes)
+
+		// Check if this is a 409 Version conflict
+		if is409Error(apiErr) {
+			// Fetch the latest version of the entity
+			latestUnit, fetchErr := apiGetUnitFromSlug(unitSlug, "*")
+			if fetchErr != nil {
+				return fmt.Errorf("set-target failed with version conflict, could not fetch latest entity: %w", fetchErr)
+			}
+
+			// Retry the patch with the latest version
+			retried = true
+			unitRes, err = cubClientNew.PatchUnitWithBodyWithResponse(
+				ctx,
+				uuid.MustParse(selectedSpaceID),
+				latestUnit.UnitID,
+				newParams,
+				"application/merge-patch+json",
+				bytes.NewReader(patchJSON),
+			)
+
+			if cubapi.IsAPIError(err, unitRes) {
+				apiErr = cubapi.InterpretErrorGeneric(err, unitRes)
+				conflicts := extractFieldConflicts(apiErr)
+				if len(conflicts) > 0 {
+					return fmt.Errorf("set-target failed after retry due to conflicts on fields: %v", conflicts)
+				}
+				return fmt.Errorf("set-target failed after retry: %w", apiErr)
+			}
+		} else {
+			return apiErr
+		}
 	}
 
 	unitDetails := unitRes.JSON200
 	displayUpdateResults(unitDetails, EntityTypeUnit, unitSlug, unitDetails.UnitID.String(), displayUnitDetails)
+	if retried && !quiet {
+		tprintRaw("Note: Set-target succeeded after retry due to version conflict.")
+	}
 	return nil
 }
 

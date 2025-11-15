@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/confighub/sdk/cubapi"
 	goclientnew "github.com/confighub/sdk/openapi/goclient-new"
@@ -191,12 +192,63 @@ func runSingleSpaceUpdate(args []string) error {
 	}
 
 	spaceRes, err := cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *newBody)
+	var retried bool
+
 	if cubapi.IsAPIError(err, spaceRes) {
-		return cubapi.InterpretErrorGeneric(err, spaceRes)
+		apiErr := cubapi.InterpretErrorGeneric(err, spaceRes)
+
+		// Check if this is a 409 Version conflict
+		if is409Error(apiErr) {
+			// Fetch the latest version of the entity
+			latestSpace, fetchErr := apiGetSpaceFromSlug(args[0], "*")
+			if fetchErr != nil {
+				return fmt.Errorf("update failed with version conflict, could not fetch latest entity: %w", fetchErr)
+			}
+
+			// Determine if retry is safe based on update mode
+			if flagReplace {
+				// For replace mode, only retry if no client-mutable fields changed
+				conflicts := detectSpaceClientMutableFieldChanges(currentSpace, latestSpace)
+				if len(conflicts) > 0 {
+					return fmt.Errorf("version conflict on fields: %v. Cannot safely retry with --replace-from-stdin", conflicts)
+				}
+				// Safe to retry - update version and retry
+				newBody.Version = latestSpace.Version
+				retried = true
+				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *newBody)
+			} else if flagPopulateModelFromStdin || flagFilename != "" {
+				// For standard update with --from-stdin (merge semantics)
+				// Merge the changes onto latestSpace
+				mergeSpaceChanges(latestSpace, newBody)
+				retried = true
+				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *latestSpace)
+			} else {
+				// No stdin input, safe to retry with latest
+				retried = true
+				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *latestSpace)
+			}
+
+			if cubapi.IsAPIError(err, spaceRes) {
+				apiErr = cubapi.InterpretErrorGeneric(err, spaceRes)
+				conflicts := extractFieldConflicts(apiErr)
+				if len(conflicts) > 0 {
+					if retried {
+						return fmt.Errorf("update failed after retry due to conflicts on fields: %v", conflicts)
+					}
+					return fmt.Errorf("update failed due to conflicts on fields: %v", conflicts)
+				}
+				return apiErr
+			}
+		} else {
+			return apiErr
+		}
 	}
 
 	spaceDetails := spaceRes.JSON200
 	displayUpdateResults(spaceDetails, "space", args[0], spaceDetails.SpaceID.String(), displaySpaceDetails)
+	if retried && !quiet {
+		tprintRaw("Note: Update succeeded after retry due to version conflict.")
+	}
 
 	return nil
 }
@@ -292,4 +344,47 @@ func runBulkSpaceUpdate() error {
 	}
 
 	return handleBulkSpaceCreateOrUpdateResponse(responses, statusCode, "patch", "")
+}
+
+// detectSpaceClientMutableFieldChanges compares two spaces and returns fields that changed
+func detectSpaceClientMutableFieldChanges(original, latest *goclientnew.Space) []string {
+	var conflicts []string
+
+	if !reflect.DeepEqual(original.Labels, latest.Labels) {
+		conflicts = append(conflicts, "Labels")
+	}
+	if !reflect.DeepEqual(original.Annotations, latest.Annotations) {
+		conflicts = append(conflicts, "Annotations")
+	}
+	if original.DisplayName != latest.DisplayName {
+		conflicts = append(conflicts, "DisplayName")
+	}
+	if !reflect.DeepEqual(original.DeleteGates, latest.DeleteGates) {
+		conflicts = append(conflicts, "DeleteGates")
+	}
+	if original.WhereTrigger != latest.WhereTrigger {
+		conflicts = append(conflicts, "WhereTrigger")
+	}
+
+	return conflicts
+}
+
+// mergeSpaceChanges merges changes from source to target space
+func mergeSpaceChanges(target, source *goclientnew.Space) {
+	// Merge mutable fields that were explicitly set in source
+	if source.Labels != nil {
+		target.Labels = source.Labels
+	}
+	if source.Annotations != nil {
+		target.Annotations = source.Annotations
+	}
+	if source.DisplayName != "" {
+		target.DisplayName = source.DisplayName
+	}
+	if source.DeleteGates != nil {
+		target.DeleteGates = source.DeleteGates
+	}
+	if source.WhereTrigger != "" {
+		target.WhereTrigger = source.WhereTrigger
+	}
 }

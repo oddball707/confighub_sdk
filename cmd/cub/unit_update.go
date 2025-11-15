@@ -5,8 +5,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -541,16 +543,84 @@ func unitUpdateCmdRun(cmd *cobra.Command, args []string) error {
 		newParams.Tag = &tagID
 	}
 
-	// Perform the update
+	// Perform the update with retry logic for 409 conflicts
 
 	var unitDetails *goclientnew.Unit
+	var retried bool
+
 	if isPatch {
 		unitDetails, err = patchUnit(spaceID, currentUnit.UnitID, newParams, patchData)
 	} else {
 		unitDetails, err = updateUnit(spaceID, currentUnit, newParams)
 	}
+
 	if err != nil {
-		return err
+		// Check if this is a 409 Version conflict
+		if is409Error(err) {
+			// Fetch the latest version of the entity
+			latestUnit, fetchErr := apiGetUnitFromSlug(args[0], "*")
+			if fetchErr != nil {
+				return fmt.Errorf("update failed with version conflict, could not fetch latest entity: %w", fetchErr)
+			}
+
+			// Determine if retry is safe based on update mode
+			if isPatch {
+				// For patch mode, check if Data field is being modified
+				var patchMap map[string]interface{}
+				if jsonErr := json.Unmarshal(patchData, &patchMap); jsonErr == nil {
+					if _, hasData := patchMap["Data"]; hasData {
+						// Don't retry if Data is being modified (treat as monolithic)
+						conflicts := extractFieldConflicts(err)
+						if len(conflicts) > 0 {
+							return fmt.Errorf("version conflict on fields: %v. Data field cannot be safely merged, update aborted", conflicts)
+						}
+						return fmt.Errorf("version conflict: Data field cannot be safely merged, update aborted")
+					}
+				}
+				// Safe to retry - reapply patch to latest version
+				retried = true
+				if isPatch {
+					unitDetails, err = patchUnit(spaceID, latestUnit.UnitID, newParams, patchData)
+				} else {
+					unitDetails, err = updateUnit(spaceID, latestUnit, newParams)
+				}
+			} else if flagReplace {
+				// For replace mode, only retry if no client-mutable fields changed
+				conflicts := detectClientMutableFieldChanges(currentUnit, latestUnit)
+				if len(conflicts) > 0 {
+					return fmt.Errorf("version conflict on fields: %v. Cannot safely retry with --replace-from-stdin", conflicts)
+				}
+				// Safe to retry - update with latest version
+				currentUnit.Version = latestUnit.Version
+				retried = true
+				unitDetails, err = updateUnit(spaceID, currentUnit, newParams)
+			} else {
+				// For standard update with --from-stdin (merge semantics)
+				// Apply the changes from currentUnit to latestUnit
+				if flagPopulateModelFromStdin || flagFilename != "" {
+					// Merge the changes onto latestUnit
+					mergeUnitChanges(latestUnit, currentUnit)
+					retried = true
+					unitDetails, err = updateUnit(spaceID, latestUnit, newParams)
+				} else {
+					// No stdin input, safe to retry with latest
+					retried = true
+					unitDetails, err = updateUnit(spaceID, latestUnit, newParams)
+				}
+			}
+		}
+
+		if err != nil {
+			// Extract field-level conflicts if available
+			conflicts := extractFieldConflicts(err)
+			if len(conflicts) > 0 {
+				if retried {
+					return fmt.Errorf("update failed after retry due to conflicts on fields: %v", conflicts)
+				}
+				return fmt.Errorf("update failed due to conflicts on fields: %v", conflicts)
+			}
+			return err
+		}
 	}
 
 	// Wait for trigger+resolve completion
@@ -565,6 +635,9 @@ func unitUpdateCmdRun(cmd *cobra.Command, args []string) error {
 	// Display results
 
 	displayUpdateResults(unitDetails, "unit", args[0], unitDetails.UnitID.String(), displayUnitDetails)
+	if retried && !quiet {
+		tprintRaw("Note: Update succeeded after retry due to version conflict.")
+	}
 	return nil
 }
 
@@ -1005,4 +1078,110 @@ func parseSelectedRevisionParameter(revisionSpec string, unitID uuid.UUID, space
 	} else {
 		return "", false, fmt.Errorf("invalid revision value '%s': must be a UUID (revision ID), integer (revision number), Tag:slug, ChangeSet:slug, Before:value, or one of LiveRevisionNum/LastAppliedRevisionNum/PreviousLiveRevisionNum/HeadRevisionNum", revisionSpec)
 	}
+}
+
+// is409Error checks if an error is a 409 Conflict error
+func is409Error(err error) bool {
+	if err == nil {
+		return false
+	}
+	errorMsg := err.Error()
+	return strings.Contains(errorMsg, "HTTP 409") || strings.Contains(errorMsg, "409")
+}
+
+// extractFieldConflicts extracts field-level conflict information from an error
+func extractFieldConflicts(err error) []string {
+	if err == nil {
+		return nil
+	}
+
+	var conflicts []string
+	var respErr *goclientnew.ResponseError
+
+	// Try to extract ResponseError from the error
+	// Use reflection to check for Error field in response struct
+	errVal := reflect.ValueOf(err)
+	if errVal.Kind() == reflect.Ptr {
+		errVal = errVal.Elem()
+	}
+
+	// Check for Error field
+	errorField := errVal.FieldByName("Error")
+	if errorField.IsValid() && !errorField.IsNil() {
+		if errorField.Type().String() == "*goclientnew.ResponseError" {
+			respErr, _ = errorField.Interface().(*goclientnew.ResponseError)
+		}
+	}
+
+	// If not found, try to parse error string as JSON
+	if respErr == nil {
+		var tryRespErr goclientnew.ResponseError
+		if jsonErr := json.Unmarshal([]byte(err.Error()), &tryRespErr); jsonErr == nil {
+			respErr = &tryRespErr
+		}
+	}
+
+	// Extract field names from ErrorMetadata.Items
+	if respErr != nil && respErr.ErrorMetadata != nil {
+		for _, item := range respErr.ErrorMetadata.Items {
+			if item.Item != "" {
+				conflicts = append(conflicts, item.Item)
+			}
+		}
+	}
+
+	return conflicts
+}
+
+// detectClientMutableFieldChanges compares two units and returns fields that changed
+func detectClientMutableFieldChanges(original, latest *goclientnew.Unit) []string {
+	var conflicts []string
+
+	if !reflect.DeepEqual(original.Labels, latest.Labels) {
+		conflicts = append(conflicts, "Labels")
+	}
+	if !reflect.DeepEqual(original.Annotations, latest.Annotations) {
+		conflicts = append(conflicts, "Annotations")
+	}
+	if original.LastChangeDescription != latest.LastChangeDescription {
+		conflicts = append(conflicts, "LastChangeDescription")
+	}
+	if original.DisplayName != latest.DisplayName {
+		conflicts = append(conflicts, "DisplayName")
+	}
+	if original.Data != latest.Data {
+		conflicts = append(conflicts, "Data")
+	}
+	if !reflect.DeepEqual(original.DeleteGates, latest.DeleteGates) {
+		conflicts = append(conflicts, "DeleteGates")
+	}
+	if !reflect.DeepEqual(original.DestroyGates, latest.DestroyGates) {
+		conflicts = append(conflicts, "DestroyGates")
+	}
+
+	return conflicts
+}
+
+// mergeUnitChanges merges changes from source to target unit
+func mergeUnitChanges(target, source *goclientnew.Unit) {
+	// Merge mutable fields that were explicitly set in source
+	if source.Labels != nil {
+		target.Labels = source.Labels
+	}
+	if source.Annotations != nil {
+		target.Annotations = source.Annotations
+	}
+	if source.LastChangeDescription != "" {
+		target.LastChangeDescription = source.LastChangeDescription
+	}
+	if source.DisplayName != "" {
+		target.DisplayName = source.DisplayName
+	}
+	if source.DeleteGates != nil {
+		target.DeleteGates = source.DeleteGates
+	}
+	if source.DestroyGates != nil {
+		target.DestroyGates = source.DestroyGates
+	}
+	// Note: Data is not merged here as it should be handled separately
 }
