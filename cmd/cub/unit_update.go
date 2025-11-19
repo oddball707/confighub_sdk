@@ -596,14 +596,24 @@ func unitUpdateCmdRun(cmd *cobra.Command, args []string) error {
 				unitDetails, err = updateUnit(spaceID, currentUnit, newParams)
 			} else {
 				// For standard update with --from-stdin (merge semantics)
-				// Apply the changes from currentUnit to latestUnit
 				if flagPopulateModelFromStdin || flagFilename != "" {
-					// Merge the changes onto latestUnit
-					mergeUnitChanges(latestUnit, currentUnit)
+					// Re-apply the stdin/file input to the latest version
+					retryUnit := latestUnit
+					if err := populateModelFromFlags(retryUnit); err != nil {
+						return fmt.Errorf("failed to re-apply changes on retry: %w", err)
+					}
+					// Re-apply command-line flags
+					if err := reapplyUnitCommandLineFlags(retryUnit); err != nil {
+						return err
+					}
 					retried = true
-					unitDetails, err = updateUnit(spaceID, latestUnit, newParams)
+					unitDetails, err = updateUnit(spaceID, retryUnit, newParams)
 				} else {
-					// No stdin input, safe to retry with latest
+					// No stdin input, just command-line flag changes - safe to retry with latest
+					// Re-apply command-line flags to latest
+					if err := reapplyUnitCommandLineFlags(latestUnit); err != nil {
+						return err
+					}
 					retried = true
 					unitDetails, err = updateUnit(spaceID, latestUnit, newParams)
 				}
@@ -1162,26 +1172,27 @@ func detectClientMutableFieldChanges(original, latest *goclientnew.Unit) []strin
 	return conflicts
 }
 
-// mergeUnitChanges merges changes from source to target unit
-func mergeUnitChanges(target, source *goclientnew.Unit) {
-	// Merge mutable fields that were explicitly set in source
-	if source.Labels != nil {
-		target.Labels = source.Labels
+// reapplyUnitCommandLineFlags re-applies command-line flags to a unit entity
+// Used during retry logic to ensure flags are applied to the latest version
+func reapplyUnitCommandLineFlags(unit *goclientnew.Unit) error {
+	if err := setLabels(&unit.Labels); err != nil {
+		return err
 	}
-	if source.Annotations != nil {
-		target.Annotations = source.Annotations
+	if err := setDeleteGates(&unit.DeleteGates); err != nil {
+		return err
 	}
-	if source.LastChangeDescription != "" {
-		target.LastChangeDescription = source.LastChangeDescription
+	if err := setDestroyGatesField(&unit.DestroyGates); err != nil {
+		return err
 	}
-	if source.DisplayName != "" {
-		target.DisplayName = source.DisplayName
+	if changeDescription != "" {
+		unit.LastChangeDescription = changeDescription
 	}
-	if source.DeleteGates != nil {
-		target.DeleteGates = source.DeleteGates
+	if changesetSlug != "" && changesetSlug != "-" {
+		changesetUUID, err := parseChangeSetSlug(changesetSlug)
+		if err != nil {
+			return err
+		}
+		unit.ChangeSetID = &changesetUUID
 	}
-	if source.DestroyGates != nil {
-		target.DestroyGates = source.DestroyGates
-	}
-	// Note: Data is not merged here as it should be handled separately
+	return nil
 }

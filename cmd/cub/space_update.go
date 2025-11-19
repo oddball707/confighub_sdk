@@ -218,12 +218,23 @@ func runSingleSpaceUpdate(args []string) error {
 				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *newBody)
 			} else if flagPopulateModelFromStdin || flagFilename != "" {
 				// For standard update with --from-stdin (merge semantics)
-				// Merge the changes onto latestSpace
-				mergeSpaceChanges(latestSpace, newBody)
+				// Re-apply the stdin/file input to the latest version
+				retryBody := latestSpace
+				if err := populateModelFromFlags(retryBody); err != nil {
+					return fmt.Errorf("failed to re-apply changes on retry: %w", err)
+				}
+				// Re-apply command-line flags
+				if err := reapplySpaceCommandLineFlags(retryBody); err != nil {
+					return err
+				}
 				retried = true
-				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *latestSpace)
+				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *retryBody)
 			} else {
-				// No stdin input, safe to retry with latest
+				// No stdin input, just command-line flag changes - safe to retry with latest
+				// Re-apply command-line flags to latest
+				if err := reapplySpaceCommandLineFlags(latestSpace); err != nil {
+					return err
+				}
 				retried = true
 				spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *latestSpace)
 			}
@@ -369,22 +380,19 @@ func detectSpaceClientMutableFieldChanges(original, latest *goclientnew.Space) [
 	return conflicts
 }
 
-// mergeSpaceChanges merges changes from source to target space
-func mergeSpaceChanges(target, source *goclientnew.Space) {
-	// Merge mutable fields that were explicitly set in source
-	if source.Labels != nil {
-		target.Labels = source.Labels
+// reapplySpaceCommandLineFlags re-applies command-line flags to a space entity
+// Used during retry logic to ensure flags are applied to the latest version
+func reapplySpaceCommandLineFlags(space *goclientnew.Space) error {
+	if err := setLabels(&space.Labels); err != nil {
+		return err
 	}
-	if source.Annotations != nil {
-		target.Annotations = source.Annotations
+	if err := setDeleteGates(&space.DeleteGates); err != nil {
+		return err
 	}
-	if source.DisplayName != "" {
-		target.DisplayName = source.DisplayName
+	if spaceUpdateArgs.whereTrigger == "-" {
+		space.WhereTrigger = ""
+	} else if spaceUpdateArgs.whereTrigger != "" {
+		space.WhereTrigger = spaceUpdateArgs.whereTrigger
 	}
-	if source.DeleteGates != nil {
-		target.DeleteGates = source.DeleteGates
-	}
-	if source.WhereTrigger != "" {
-		target.WhereTrigger = source.WhereTrigger
-	}
+	return nil
 }
